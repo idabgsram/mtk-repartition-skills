@@ -2,6 +2,7 @@
 """gpt_tool.py - inspect, plan and verify GPT edits on dumps taken from an Android device.
 
 Works OFFLINE on dump files (Python 3, stdlib only). It never writes to a block device.
+(The zips built by `mkzip` do, but only when flashed in recovery on the device.)
 `show` may read a block device read-only, but the normal flow is to work on dumps.
 
 Dump files (all in units of the LOGICAL sector size SS of the disk):
@@ -17,6 +18,8 @@ Subcommands:
   plan     --primary P --backup B --sector SS --dev DEV --out DIR  ops...
   verify   --orig-primary P --orig-backup B --new-primary NP --new-backup NB --sector SS
            [--expect-changed a,b] [--expect-added x,y]
+  mkzip    --plan DIR --sector SS [--by-name super] [--name NAME] [--out DIR]
+           builds apply-NAME.zip and undo-NAME.zip, flashable in TWRP (update-binary shell script)
 
 Every inconsistency is an error; the tool then exits with status 1 and prints "STOP".
 """
@@ -558,14 +561,14 @@ def build_copy(orig, parts, n):
                 continue
             ent[i * esz:(i + 1) * esz] = b'\0' * esz
             continue
-        if i < orig.h['n']:
-            o = old[i * esz:(i + 1) * esz]
+        o = old[i * esz:(i + 1) * esz] if i < orig.h['n'] else b'\0' * esz
+        if entry_fields(o)[0] != b'\0' * 16:                         # existing partition
             t, u, f, l, a, nm = entry_fields(o)
             if (f, l) == (p['first'], p['last']):
                 continue
             e = bytearray(o)
             e[32:48] = struct.pack('<QQ', p['first'], p['last'])     # only the LBAs change
-        else:
+        else:                                                        # new partition (empty slot)
             e = make_entry(p['type'], p['uniq'], p['first'], p['last'], p['attr'], p['name'], esz)
         ent[i * esz:(i + 1) * esz] = e
     c.img[c.eoff:c.eoff + n * esz] = ent
@@ -801,6 +804,357 @@ def cmd_verify(args):
     print('RESULT: VERIFY OK')
 
 
+# ---------------------------------------------------------------- mkzip (flashable recovery zips)
+UPDATE_BINARY = r'''#!/sbin/sh
+# update-binary written by gpt_tool.py mkzip. Mode: @@MODE@@ (@@WHAT@@).
+# Recovery (TWRP or any recovery using the update-binary shell mechanism) runs it as:
+#   update-binary <api> <OUTFD> <zip path>
+# It refuses (exit 1, writes nothing) unless every check passes. It never formats anything.
+# TEST ONLY: MTKREP_TEST_ROOT=<dir> makes it use <dir>/dev/block/..., <dir>/sys/..., <dir>/proc/mounts
+# and accept a regular file as the disk. It exists for offline tests on a PC; never set it on a device.
+OUTFD=$2
+ZIP=$3
+case "$OUTFD" in ''|*[!0-9]*) OUTFD=1 ;; esac
+
+MODE=@@MODE@@
+NAME='@@NAME@@'
+OTHERZIP='@@OTHERZIP@@'
+DISK=@@DISK@@
+BYNAME=@@BYNAME@@
+SS=@@SS@@
+SIZE512=@@SIZE512@@
+PCNT=@@PCNT@@
+BSTART=@@BSTART@@
+BCNT=@@BCNT@@
+CHANGED='@@CHANGED@@'
+# images this zip writes (AFTER) and images the disk must hold now (BEFORE)
+AFTER_P=gpt/@@AFTER_P@@
+AFTER_P_SHA=@@AFTER_P_SHA@@
+AFTER_B=gpt/@@AFTER_B@@
+AFTER_B_SHA=@@AFTER_B_SHA@@
+BEFORE_P=gpt/@@BEFORE_P@@
+BEFORE_P_SHA=@@BEFORE_P_SHA@@
+BEFORE_B=gpt/@@BEFORE_B@@
+BEFORE_B_SHA=@@BEFORE_B_SHA@@
+MANIFEST_SHA=@@MANIFEST_SHA@@
+
+R=${MTKREP_TEST_ROOT:-}
+MOUNTS=/proc/mounts
+[ -n "$R" ] && MOUNTS=$R/proc/mounts
+T=${TMPDIR:-/tmp}/mtkrep-$MODE-$$
+WRITING=0
+
+ui_print() {
+  echo "ui_print $*" >&$OUTFD
+  echo "ui_print" >&$OUTFD
+  [ "$OUTFD" = 1 ] || echo "$*"
+}
+refuse() {
+  ui_print "!! STOP: $*"
+  ui_print "!! Nothing was written. The disk is unchanged."
+  rm -rf "$T"
+  exit 1
+}
+disaster() {
+  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  ui_print "!! GPT WRITE FAILED: $*"
+  ui_print "!! The disk may now hold a half-written table."
+  ui_print "!! DO NOT REBOOT. DO NOT FORMAT ANYTHING."
+  ui_print "!! 1. Flash $OTHERZIP now (it accepts a half-applied"
+  ui_print "!!    table), or flash this zip again."
+  ui_print "!! 2. If both refuse, restore the ORIGINAL GPT from"
+  ui_print "!!    'adb shell' in recovery (files kept in $T):"
+  ui_print "!!  dd if=$T/gpt/gpt-primary.bin of=$DEV bs=$SS count=$PCNT conv=notrunc,fsync"
+  ui_print "!!  dd if=$T/gpt/gpt-backup.bin of=$DEV bs=$SS seek=$BSTART count=$BCNT conv=notrunc,fsync"
+  ui_print "!! 3. Last resort: SP Flash Tool with the stock firmware."
+  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  exit 1
+}
+hash_file() {
+  _h=$($SHA "$1" 2>/dev/null) || return 1
+  echo "${_h%% *}"
+}
+hash_disk() {   # hash_disk SKIP COUNT
+  _h=$(dd if="$DEV" bs=$SS skip=$1 count=$2 2>/dev/null | $SHA 2>/dev/null) || return 1
+  echo "${_h%% *}"
+}
+
+ui_print "=================================================="
+ui_print " MTK GPT $MODE: $NAME"
+ui_print " @@WHAT@@"
+ui_print " disk $DISK, sector $SS, located via by-name/$BYNAME"
+ui_print "=================================================="
+[ -n "$R" ] && ui_print "TEST MODE (MTKREP_TEST_ROOT=$R): not a real device"
+
+# 1. tools
+if [ -z "$R" ] && [ "$(id -u 2>/dev/null)" != 0 ]; then refuse "not running as root"; fi
+if echo | sha256sum >/dev/null 2>&1; then SHA=sha256sum
+elif echo | busybox sha256sum >/dev/null 2>&1; then SHA="busybox sha256sum"
+else refuse "no sha256sum (toybox or busybox) in this recovery"; fi
+if command -v unzip >/dev/null 2>&1; then UNZIP=unzip
+elif command -v busybox >/dev/null 2>&1; then UNZIP="busybox unzip"
+else refuse "no unzip in this recovery"; fi
+command -v dd >/dev/null 2>&1 || refuse "no dd in this recovery"
+command -v readlink >/dev/null 2>&1 || refuse "no readlink in this recovery"
+[ -f "$ZIP" ] || refuse "zip file not found: $ZIP"
+
+# 2. payload
+rm -rf "$T"; mkdir -p "$T" || refuse "cannot create $T"
+$UNZIP -o "$ZIP" manifest.txt gpt/gpt-primary.bin gpt/gpt-backup.bin gpt/new-primary.bin gpt/new-backup.bin \
+  -d "$T" >/dev/null 2>&1 || refuse "cannot unzip the payload from $ZIP"
+for f in "manifest.txt:$MANIFEST_SHA" "$AFTER_P:$AFTER_P_SHA" "$AFTER_B:$AFTER_B_SHA" \
+         "$BEFORE_P:$BEFORE_P_SHA" "$BEFORE_B:$BEFORE_B_SHA"; do
+  n=${f%%:*}; s=${f#*:}
+  [ -f "$T/$n" ] || refuse "payload file $n missing from the zip"
+  [ "$(hash_file "$T/$n")" = "$s" ] || refuse "payload file $n has a wrong sha256 (damaged or edited zip)"
+done
+ui_print "- payload sha256 OK"
+
+# 3. find the disk: by-name/<BYNAME> -> partition -> parent disk; must equal the manifest disk
+L=
+for d in "$R/dev/block/by-name" "$R"/dev/block/platform/*/by-name "$R"/dev/block/platform/*/*/by-name \
+         "$R/dev/block/bootdevice/by-name"; do
+  if [ -e "$d/$BYNAME" ]; then L=$d/$BYNAME; BYDIR=$d; break; fi
+done
+[ -n "$L" ] || refuse "by-name link '$BYNAME' not found under /dev/block/by-name or /dev/block/platform/*/by-name"
+PNODE=$(readlink -f "$L") || refuse "cannot resolve $L"
+PNAME=${PNODE##*/}
+[ -e "$R/sys/class/block/$PNAME/partition" ] || refuse "$L -> $PNODE is not a partition"
+PDISK=$(readlink -f "$R/sys/class/block/$PNAME/..") || refuse "cannot find the disk of $PNAME"
+PDISK=${PDISK##*/}
+[ "$PDISK" = "$DISK" ] || refuse "by-name/$BYNAME is on disk '$PDISK', but this zip was made for disk '$DISK' (wrong device or wrong zip)"
+DEV=$R/dev/block/$DISK
+if [ -n "$R" ]; then [ -f "$DEV" ] || [ -b "$DEV" ] || refuse "test disk image $DEV missing"
+else [ -b "$DEV" ] || refuse "$DEV is not a block device"; fi
+ui_print "- disk: by-name/$BYNAME -> $PNAME on $DISK (matches)"
+
+# 4. sector size and disk size
+v=$(cat "$R/sys/block/$DISK/queue/logical_block_size" 2>/dev/null)
+[ "$v" = "$SS" ] || refuse "sector size of $DISK is '$v', this zip was made for $SS"
+v=$(cat "$R/sys/block/$DISK/size" 2>/dev/null)
+[ "$v" = "$SIZE512" ] || refuse "size of $DISK is '$v' (512-byte units), this zip was made for $SIZE512 (wrong disk or wrong zip)"
+ui_print "- sector size $SS and disk size $SIZE512 x 512 OK"
+
+# 5. partitions whose place changes must not be mounted (a mounted userdata keeps writing at the old place)
+for p in $CHANGED; do
+  if [ -e "$BYDIR/$p" ]; then
+    n=$(readlink -f "$BYDIR/$p")
+    if grep -q "^$n " "$MOUNTS" 2>/dev/null || grep -q "^/dev/block/${n##*/} " "$MOUNTS" 2>/dev/null; then
+      refuse "$p ($n) is mounted. In TWRP: Mount > untick it (Data and others), then flash again"
+    fi
+  fi
+  if [ "$p" = userdata ] && grep -q " /data " "$MOUNTS" 2>/dev/null; then
+    refuse "/data is mounted. In TWRP: Mount > untick Data, then flash this zip again"
+  fi
+done
+
+# 6. what is on the disk now
+cur_p=$(hash_disk 0 $PCNT) || refuse "cannot read the primary GPT area of $DEV"
+cur_b=$(hash_disk $BSTART $BCNT) || refuse "cannot read the backup GPT area of $DEV"
+if [ "$cur_p" = "$AFTER_P_SHA" ]; then need_p=0
+elif [ "$cur_p" = "$BEFORE_P_SHA" ]; then need_p=1
+else refuse "the primary GPT on $DISK (LBA 0..$((PCNT - 1))) is neither the expected BEFORE table nor the target table. Wrong device, or the table changed since the plan: dump again and re-plan"; fi
+if [ "$cur_b" = "$AFTER_B_SHA" ]; then need_b=0
+elif [ "$cur_b" = "$BEFORE_B_SHA" ]; then need_b=1
+else refuse "the backup GPT on $DISK (LBA $BSTART..$((BSTART + BCNT - 1))) is neither the expected BEFORE table nor the target table. Wrong device, or the table changed since the plan: dump again and re-plan"; fi
+if [ $need_p = 0 ] && [ $need_b = 0 ]; then
+  ui_print "- ALREADY APPLIED: $DISK already holds the target table of this zip."
+  ui_print "  Nothing written."
+  rm -rf "$T"
+  exit 0
+fi
+[ $need_p = 1 ] && [ $need_b = 1 ] || ui_print "- note: half-applied table found; only the missing copy is written"
+
+# 7. dd must support conv=notrunc,fsync (tried on a scratch file first)
+dd if="$T/$AFTER_P" of="$T/ddtest" bs=$SS count=1 conv=notrunc,fsync >/dev/null 2>&1 \
+  || refuse "this recovery's dd does not support conv=notrunc,fsync"
+ui_print "- all checks passed; writing"
+
+# 8. write primary, then backup
+WRITING=1
+if [ $need_p = 1 ]; then
+  dd if="$T/$AFTER_P" of="$DEV" bs=$SS count=$PCNT conv=notrunc,fsync >/dev/null 2>&1 || disaster "primary write failed"
+  ui_print "- primary GPT written ($PCNT sectors at LBA 0)"
+fi
+if [ $need_b = 1 ]; then
+  dd if="$T/$AFTER_B" of="$DEV" bs=$SS seek=$BSTART count=$BCNT conv=notrunc,fsync >/dev/null 2>&1 || disaster "backup write failed"
+  ui_print "- backup GPT written ($BCNT sectors at LBA $BSTART)"
+fi
+sync
+[ -z "$R" ] && [ -w /proc/sys/vm/drop_caches ] && echo 3 > /proc/sys/vm/drop_caches
+p=$(hash_disk 0 $PCNT); b=$(hash_disk $BSTART $BCNT)
+[ "$p" = "$AFTER_P_SHA" ] || disaster "PRIMARY READBACK MISMATCH ($p)"
+[ "$b" = "$AFTER_B_SHA" ] || disaster "BACKUP READBACK MISMATCH ($b)"
+ui_print "- readback sha256 of both copies OK"
+rm -rf "$T"
+ui_print "=================================================="
+ui_print " $MODE DONE: the target table is on the disk."
+ui_print " This recovery still uses the OLD table until reboot."
+ui_print " Do NOT mount, format, wipe or flash anything else now."
+ui_print " Next: Reboot > Bootloader (LK fastboot), then on the PC:"
+@@POSTSTEPS@@
+ui_print "=================================================="
+exit 0
+'''
+
+
+def _sh_quote_ok(s):
+    return re.fullmatch(r'[A-Za-z0-9_.,;:+ -]*', s) is not None
+
+
+def cmd_mkzip(args):
+    import zipfile
+    ss, pd = args.sector, args.plan
+    files = {nm: os.path.join(pd, nm) for nm in ('gpt-primary.bin', 'gpt-backup.bin', 'new-primary.bin',
+                                                  'new-backup.bin', 'plan.txt')}
+    for nm, path in files.items():
+        if not os.path.isfile(path):
+            raise Stop(f'{path} missing: give the directory written by `plan`')
+    with open(files['plan.txt']) as f:
+        plan_txt = f.read()
+    m = re.match(r'# plan summary \(sector (\d+), device (\S+)\)', plan_txt)
+    if not m:
+        raise Stop('plan.txt has no "# plan summary (sector SS, device DEV)" first line')
+    if int(m.group(1)) != ss:
+        raise Stop(f'plan.txt says sector {m.group(1)}, --sector is {ss}')
+    disk = os.path.basename(m.group(2))
+    if args.disk and args.disk != disk:
+        raise Stop(f'--disk {args.disk} differs from the plan device {m.group(2)}')
+    if not re.fullmatch(r'sd[a-z]+|mmcblk\d+', disk):
+        raise Stop(f'disk name {disk!r} (from the plan device {m.group(2)}) is not a whole disk like sdc or mmcblk0')
+    blobs = {}
+    for nm in ('gpt-primary.bin', 'gpt-backup.bin', 'new-primary.bin', 'new-backup.bin'):
+        blobs[nm] = read_file(files[nm])
+        want = re.search(r'^sha256 ' + re.escape(nm) + r'\s+([0-9a-f]{64})$', plan_txt, re.M)
+        if not want:
+            raise Stop(f'plan.txt has no sha256 line for {nm}')
+        if sha256(blobs[nm]) != want.group(1):
+            raise Stop(f'{nm} does not match the sha256 recorded in plan.txt (changed after planning?)')
+    op, ob = load_pair(files['gpt-primary.bin'], files['gpt-backup.bin'], ss)
+    np_, nb = load_pair(files['new-primary.bin'], files['new-backup.bin'], ss)
+    errs, changed, added = compare(op, ob, np_, nb)
+    for x in errs:
+        print('ERROR: ' + x)
+    if errs:
+        raise Stop('the plan files do not verify; re-run plan')
+    if not changed and not added:
+        raise Stop('the new table is identical to the original; nothing to do')
+    if len(op.img) // ss > op.lowest() or ob.start_lba <= op.highest() or ob.start_lba <= np_.highest():
+        raise Stop('the GPT areas of the plan reach into partition data; re-dump with `dumpcmds` and re-plan')
+    oldnames = {p['name']: p for p in op.parts()}
+    newnames = {p['name']: p for p in np_.parts()}
+    byname = args.by_name
+    if byname is None:
+        byname = 'super' if 'super' in oldnames else sorted(set(oldnames) & set(newnames))[0]
+    if byname not in oldnames or byname not in newnames:
+        raise Stop(f'--by-name {byname}: must be a partition in both the original and the new table')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', byname) or not all(re.fullmatch(r'[A-Za-z0-9_.-]+', c) for c in changed):
+        raise Stop('partition names with unusual characters are not supported by mkzip')
+    pcnt, bstart, bcnt = len(op.img) // ss, ob.start_lba, len(ob.img) // ss
+    disk_sectors = ob.h['cur'] + 1
+    size512 = disk_sectors * ss // 512
+    name = args.name or os.path.basename(os.path.normpath(pd))
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
+        raise Stop(f'--name {name!r}: use only A-Z a-z 0-9 _ . -')
+    out = args.out or pd
+    os.makedirs(out, exist_ok=True)
+    shas = {nm: sha256(b) for nm, b in blobs.items()}
+    zips = {'apply': f'apply-{name}.zip', 'undo': f'undo-{name}.zip'}
+
+    def sizes(parts, names):
+        return [(p['name'], (p['last'] - p['first'] + 1) * ss) for p in sorted(parts, key=lambda p: p['first'])
+                if p['name'] in names]
+
+    results = []
+    for mode in ('apply', 'undo'):
+        if mode == 'apply':
+            after, before = ('new-primary.bin', 'new-backup.bin'), ('gpt-primary.bin', 'gpt-backup.bin')
+            what = 'writes the NEW partition table'
+            expect = sizes(np_.parts(), set(changed) | set(added))
+            gone = []
+        else:
+            after, before = ('gpt-primary.bin', 'gpt-backup.bin'), ('new-primary.bin', 'new-backup.bin')
+            what = 'restores the ORIGINAL partition table'
+            expect = sizes(op.parts(), set(changed))
+            gone = list(added)
+        manifest = '\n'.join([
+            f'# mtk-repartition flashable zip manifest',
+            f'mode={mode}',
+            f'name={name}',
+            f'disk={disk}',
+            f'by_name={byname}',
+            f'logical_sector_size={ss}',
+            f'disk_size_sectors={disk_sectors}',
+            f'disk_size_512={size512}',
+            f'primary_lba={0}',
+            f'primary_count={pcnt}',
+            f'backup_lba={bstart}',
+            f'backup_count={bcnt}',
+            f'changed={",".join(changed)}',
+            f'added={",".join(added)}',
+            f'writes={after[0]},{after[1]}',
+            f'expects_on_disk={before[0]},{before[1]}',
+        ] + [f'sha256 gpt/{nm} {shas[nm]}' for nm in ('gpt-primary.bin', 'gpt-backup.bin', 'new-primary.bin',
+                                                        'new-backup.bin')]
+            + [f'expected partition-size:{n} {v:#x}' for n, v in expect]
+            + [f'removed_partition={n}' for n in gone]) + '\n'
+        post = ['fastboot devices']
+        post += [f'fastboot getvar partition-size:{n}   (must be {v:#x})' for n, v in expect]
+        if gone:
+            post.append(f'(partitions {", ".join(gone)} no longer exist after the undo)')
+        if 'userdata' in changed:
+            post += ['fastboot erase userdata', 'fastboot erase metadata']
+            post.append('(only after every getvar above matched)')
+        post.append('fastboot reboot')
+        if mode == 'undo':
+            post.append('Undo restores only the TABLE, not data: userdata must be')
+            post.append('erased again; data in removed partitions and in super')
+            post.append('beyond its original size is lost. If you flashed a super')
+            post.append('image built for the bigger super, flash the stock super.')
+        for ln in post:
+            if not _sh_quote_ok(ln.replace('(', '').replace(')', '')):
+                raise Stop(f'internal: unexpected characters in {ln!r}')
+        ub = UPDATE_BINARY
+        rep = {
+            'MODE': mode, 'WHAT': what, 'NAME': name, 'OTHERZIP': zips['undo' if mode == 'apply' else 'apply'],
+            'DISK': disk, 'BYNAME': byname, 'SS': str(ss), 'SIZE512': str(size512), 'PCNT': str(pcnt),
+            'BSTART': str(bstart), 'BCNT': str(bcnt), 'CHANGED': ' '.join(changed),
+            'AFTER_P': after[0], 'AFTER_P_SHA': shas[after[0]], 'AFTER_B': after[1], 'AFTER_B_SHA': shas[after[1]],
+            'BEFORE_P': before[0], 'BEFORE_P_SHA': shas[before[0]], 'BEFORE_B': before[1],
+            'BEFORE_B_SHA': shas[before[1]], 'MANIFEST_SHA': sha256(manifest.encode()),
+            'POSTSTEPS': '\n'.join(f'ui_print "   {ln}"' for ln in post),
+        }
+        for k, v in rep.items():
+            ub = ub.replace(f'@@{k}@@', v)
+        if '@@' in ub:
+            raise Stop('internal: unreplaced placeholder in update-binary')
+        zpath = os.path.join(out, zips[mode])
+        entries = [('META-INF/com/google/android/update-binary', ub.encode(), 0o755),
+                   ('META-INF/com/google/android/updater-script',
+                    b'#MAGIC\n# Dummy file; the real work is done by update-binary (a shell script).\n', 0o644),
+                   ('manifest.txt', manifest.encode(), 0o644)]
+        entries += [(f'gpt/{nm}', blobs[nm], 0o644) for nm in ('gpt-primary.bin', 'gpt-backup.bin',
+                                                                'new-primary.bin', 'new-backup.bin')]
+        with zipfile.ZipFile(zpath + '.tmp', 'w', zipfile.ZIP_STORED) as z:
+            for arc, data, mode_bits in entries:
+                zi = zipfile.ZipInfo(arc, date_time=(2020, 1, 1, 0, 0, 0))
+                zi.create_system = 3
+                zi.external_attr = (0o100000 | mode_bits) << 16
+                z.writestr(zi, data)
+        os.replace(zpath + '.tmp', zpath)
+        with open(zpath, 'rb') as f:
+            results.append((zpath, sha256(f.read()), what))
+    print(f'disk {disk} (located via by-name/{byname}), sector {ss}, disk size {disk_sectors} sectors '
+          f'= {size512} x 512 bytes')
+    print(f'primary area LBA 0..{pcnt - 1}, backup area LBA {bstart}..{bstart + bcnt - 1}')
+    print('changed: ' + (', '.join(changed) or 'none'))
+    print('added:   ' + (', '.join(added) or 'none'))
+    for zp, zs, what in results:
+        print(f'{zp}: {what}\n  sha256 {zs}')
+    print('Keep BOTH zips off the device as well. Flash the apply zip in recovery; the undo zip reverts it.')
+    print('RESULT: MKZIP OK')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -842,12 +1196,21 @@ def main():
     s.add_argument('--expect-added')
     s.add_argument('--allow-change', action='append')
 
+    s = sub.add_parser('mkzip', help='build flashable recovery zips (apply + undo) from a plan directory')
+    s.add_argument('--plan', required=True, help='directory written by `plan`')
+    s.add_argument('--sector', type=int, required=True)
+    s.add_argument('--disk', help='whole-disk name, e.g. sdc (default and cross-check: the plan --dev)')
+    s.add_argument('--by-name', help='partition present before and after, used to find the disk (default super)')
+    s.add_argument('--name', help='zip name suffix (default: plan directory name)')
+    s.add_argument('--out', help='output directory (default: the plan directory)')
+
     args = ap.parse_args()
     if getattr(args, 'sector', None) not in (512, 4096):
         print('STOP: --sector must be 512 or 4096 (read /sys/block/<disk>/queue/logical_block_size)')
         return 1
     try:
-        {'show': cmd_show, 'dumpcmds': cmd_dumpcmds, 'plan': cmd_plan, 'verify': cmd_verify}[args.cmd](args)
+        {'show': cmd_show, 'dumpcmds': cmd_dumpcmds, 'plan': cmd_plan, 'verify': cmd_verify,
+         'mkzip': cmd_mkzip}[args.cmd](args)
     except Stop as e:
         print(f'STOP: {e}')
         return 1

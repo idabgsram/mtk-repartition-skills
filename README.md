@@ -28,10 +28,36 @@ skills/mtk-repartition/
 | `dumpcmds` | Prints the exact `dd` commands that dump both GPT copies, with limits taken from the partitions (on MTK, partitions such as `misc` can start below `first_usable_lba`, so a blind `count=34` dump would include partition data) |
 | `plan` | `--grow NAME:+SIZE --take-from NEXT`, `--shrink-end NAME:SIZE`, `--add NAME:SIZE\|rest` (1 MiB aligned). Writes the new primary/backup images, `plan.txt` (expected `fastboot getvar partition-size` values, sha256s), `write-gpt.sh` and `restore-gpt.sh` |
 | `verify` | Independent check of a plan: CRCs, overlaps, usable range, entry capacity, unchanged entries byte-identical, protected partitions untouched, expected changed/added names |
+| `mkzip` | `--plan DIR --sector SS [--name NAME] [--by-name super] [--out DIR]`. Builds `apply-NAME.zip` and `undo-NAME.zip`, flashable in TWRP (see below) |
 
 The generated `write-gpt.sh` is a dry run unless given `--write`. Before writing, it checks root, the sector size,
 the disk size and the sha256 of every file, and that the disk still holds exactly the backed-up GPT. It then writes
 the primary and backup copies and reads both back. `restore-gpt.sh` puts the original GPT back the same way.
+
+### Flashable recovery zips (`mkzip`)
+
+As an alternative to running `write-gpt.sh` from rooted Android, `mkzip` turns a verified plan directory into two
+zips for TWRP or any recovery that runs `META-INF/com/google/android/update-binary` as a shell script:
+
+- `apply-NAME.zip` writes the new GPT; `undo-NAME.zip` writes the original GPT back.
+- Each zip holds the `update-binary` (POSIX `sh`, works with toybox or busybox), a `#MAGIC` `updater-script`
+  placeholder, all four GPT images (`gpt/gpt-primary.bin`, `gpt/gpt-backup.bin`, `gpt/new-primary.bin`,
+  `gpt/new-backup.bin`) and `manifest.txt` (disk name, by-name partition used to find the disk, logical sector size,
+  disk size, LBA offsets/counts, sha256 of every image, expected `partition-size` values).
+- Before writing, the script requires: the by-name link (default `super`) resolves to a partition of the manifest disk;
+  `/sys/block/DISK/queue/logical_block_size` and `/sys/block/DISK/size` match; every payload file and the manifest
+  have the recorded sha256; `/data` and the changed partitions are not mounted; and each GPT copy on disk is
+  exactly the expected "before" image or already the target image. Anything else: it prints `!! STOP: ...`, writes
+  nothing, and exits 1. If the disk already holds the target table it says `ALREADY APPLIED` and exits 0.
+- It writes the primary copy, then the backup copy (`dd conv=notrunc,fsync`), syncs, reads both back and compares
+  sha256. On a failure it prints how to recover (flash the other zip, which accepts a half-written table, or the exact
+  `dd` lines to run from the recovery's `adb shell`).
+- It never formats anything. The recovery keeps the old partition table until reboot, so the script tells the user
+  to reboot to LK fastboot, check `getvar partition-size`, then erase `userdata` and `metadata` when userdata changed.
+- The undo zip restores only the table, not data: userdata must be erased again, added partitions are gone, and
+  content of `super` beyond its original size is lost.
+- `MTKREP_TEST_ROOT=<dir>` is a test-only switch (fake `/dev/block`, `/sys`, `/proc/mounts`, an image file as the
+  disk) for offline tests; never set it on a device.
 
 ## Install
 
@@ -63,3 +89,9 @@ synthetic 512- and 4096-byte-sector images: the full flow (dump, plan, verify, w
 the refusal cases (bad CRCs, protected partitions, unaligned sizes, overlapping or oversized plans, mismatched
 dumps). The device-side scripts were exercised with GNU tools, not yet with toybox on Android, and the `lpmake`
 re-flash path is described only at a high level.
+
+The `mkzip` update-binary was tested offline under `dash` and `busybox sh` (with a busybox-only `PATH`, as in TWRP)
+against 512- and 4096-byte-sector disk images and a sparse full-size image built from the real MT6789 dumps: apply,
+re-apply, undo back to a byte-identical disk, half-written tables, and the refusal cases (wrong disk size, sector
+size or disk, tampered payload, unexpected table, mounted `/data`, missing `sha256sum`). It has not yet been
+flashed in TWRP on a device.

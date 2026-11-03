@@ -1,6 +1,6 @@
 ---
 name: mtk-repartition
-description: Safely edit the GPT partition table of a MediaTek (MTK) Android phone or tablet (UFS or eMMC) from a rooted Android shell over adb. Use when the user wants to grow `super`, shrink `userdata`, add new partitions in the freed space (for example for a second OS), check or back up the GPT, or restore the original GPT from backups. Does not cover Qualcomm/Exynos devices, resizing filesystems in place, or anything done through SP Flash Tool scatter files.
+description: Safely edit the GPT partition table of a MediaTek (MTK) Android phone or tablet (UFS or eMMC) from a rooted Android shell over adb. Use when the user wants to grow `super`, shrink `userdata`, add new partitions in the freed space (for example for a second OS), check or back up the GPT, restore the original GPT from backups, or build flashable TWRP zips that apply or undo the change. Does not cover Qualcomm/Exynos devices, resizing filesystems in place, or anything done through SP Flash Tool scatter files.
 ---
 
 # MTK GPT repartition (grow super / shrink userdata / add partitions / restore)
@@ -10,8 +10,9 @@ Every step is written out. Do them in order. Do not improvise, skip, or merge st
 
 The helper `gpt_tool.py` sits next to this file (use its absolute path, called `TOOL` below).
 It runs on the **PC** (Python 3, no extra packages). It works only on dump files and never
-writes to the device. Every command ends with `RESULT: ...` on success, or prints `STOP: ...`
-and exits with status 1. If you see `STOP:` or `ERROR:`, STOP.
+writes to the device (the zips from `mkzip` write only when flashed in recovery, section 14).
+Every command ends with `RESULT: ...` on success, or prints `STOP: ...` and exits with status 1.
+If you see `STOP:` or `ERROR:`, STOP.
 
 ## 1. When to use / when not
 
@@ -181,6 +182,8 @@ area, every untouched entry byte-identical, and only the listed partitions chang
 
 ## 9. Write (device)
 
+To write from TWRP with a flashable zip instead of the rooted Android shell, see section 14.
+
 1. Push the plan files:
    ```sh
    adb push plan1/new-primary.bin plan1/new-backup.bin plan1/write-gpt.sh plan1/restore-gpt.sh /data/local/tmp/gpt/
@@ -229,6 +232,8 @@ Keep the `gpt-work/` files and the off-device copies.
 
 ## 11. Restore the original GPT
 
+From TWRP instead: flash `undo-NAME.zip` (section 14).
+
 From a rooted Android (the backups must still match: `restore-gpt.sh` checks their sha256):
 ```sh
 adb shell mkdir -p /data/local/tmp/gpt
@@ -274,13 +279,91 @@ AFTER table with the old `plan.txt`; the LBA ranges should be identical.
 | LK still shows the OLD userdata size | the write did not land or LK did not re-read: `fastboot reboot-bootloader`; if still old, boot Android, run `python3 TOOL show` on a fresh dump; do not erase until it matches. |
 | Android boot loops / "Can't load Android system" | userdata or metadata was not erased: LK fastboot `fastboot erase userdata` + `fastboot erase metadata`, or pick "Factory data reset" in recovery. |
 | Android boots but storage shows the old size | userdata was not re-created; erase userdata + metadata again. |
+| zip: `/data is mounted` / `... is mounted` | TWRP mounted Data: **Mount** > untick Data, flash again. |
+| zip: `by-name link ... not found` | this recovery names the by-name dir differently or does not see the disk; check `ls -l /dev/block/by-name/` in its adb shell; STOP if `super` is missing. |
+| zip: `primary/backup GPT on DISK ... is neither ...` | wrong device, or the table changed since the dump (e.g. after SP Flash Tool); dump again from Android (section 4), re-plan, rebuild the zips. |
+| zip: `no sha256sum` / `no unzip` | the recovery lacks toybox/busybox tools; use section 9 from rooted Android instead. |
 | `lpdump` shows the old super size | expected; see section 6. |
 | `dd: Operation not permitted` / read-only | not root (`su -c id`), or the disk is read-only: `adb shell su -c "blockdev --setrw DEV"`, then retry the dry run. |
 
+## 14. Alternative: apply from TWRP with a flashable zip
+
+Use this instead of section 9 (and to undo instead of section 11) when the change should be
+written from a custom recovery: TWRP, or any recovery that runs
+`META-INF/com/google/android/update-binary` from a zip as a shell script. Typical reasons: the
+user prefers recovery, or Android root is no longer available after the change. Sections 2-8
+still apply in full: root dumps, the off-device backup copy, the data-loss confirmation, `plan`
+and **`verify` (section 8) must be done first**. The zip does not replace any of them.
+
+Extra prerequisites (STOP if one is missing):
+- A recovery for this exact device that boots and shows `adb devices` as `recovery`.
+- In the recovery's `adb shell`: `ls -l /dev/block/by-name/` lists `super` (or the partition you
+  pass to `--by-name`) on the same disk `DISK` as in the worksheet.
+- The zip must NOT be stored in internal storage (`/sdcard` lives inside userdata, which must
+  be unmounted for the flash). Use `adb sideload`, or `adb push` to `/tmp`, or an external
+  SD card / USB stick.
+
+1. Build the zips on the PC (after section 8 printed `RESULT: VERIFY OK`):
+   ```sh
+   python3 TOOL mkzip --plan plan1 --sector SS --name NAME
+   ```
+   `NAME` is a short word (A-Z a-z 0-9 _ . -), e.g. `hakios`. It must end with
+   `RESULT: MKZIP OK` and writes `plan1/apply-NAME.zip` and `plan1/undo-NAME.zip`. It re-checks the
+   plan files against `plan.txt`. It takes the disk name from the plan's `--dev`; check that the
+   printed `disk` and `sector` match the worksheet, else STOP. Optional: `--by-name PART` (default
+   `super`; must exist in the old and the new table), `--out DIR`.
+2. Copy BOTH zips to a second place off the device (like the GPT backups). The undo zip is the
+   way back; it never needs to be on the device before you use it.
+3. Show the user `unzip -p plan1/apply-NAME.zip manifest.txt` (disk, sector size, disk size,
+   LBA ranges, sha256 of every image, expected partition sizes). Get the final "yes, wipe
+   userdata" again.
+4. Reboot to recovery (`adb reboot recovery`). In TWRP: **Mount** > untick **Data** (and any other
+   ticked partition on the same disk). The zip refuses while `/data` or a changed partition is
+   mounted.
+5. Flash the apply zip. Either:
+   - TWRP **Advanced > ADB Sideload**, untick "Wipe Dalvik Cache" and "Wipe Cache", swipe, then on
+     the PC: `adb sideload plan1/apply-NAME.zip`; or
+   - `adb push plan1/apply-NAME.zip /tmp/`, then **Install** > navigate to `/tmp` > select it >
+     swipe (leave "zip signature verification" off; the zip is not signed).
+6. Read the recovery screen (or `adb pull /tmp/recovery.log`). The zip first checks, and writes
+   nothing (exit with `!! STOP: ...` and `Nothing was written`) unless ALL hold:
+   - `by-name/<PART>` resolves to a partition of the manifest disk (e.g. `sdc`);
+   - `/sys/block/DISK/queue/logical_block_size` = SS and `/sys/block/DISK/size` = the manifest size;
+   - sha256 of every file in the zip matches;
+   - each GPT copy on disk is exactly the expected "before" image (or already the target image).
+   On `STOP`: STOP and report the message. Do not edit the zip or try another zip.
+   - `ALREADY APPLIED`: the disk already has this table; nothing was written; continue with step 7.
+   - `apply DONE`: both copies were written (primary first, then backup) and read back with
+     matching sha256.
+   - `GPT WRITE FAILED` / `READBACK MISMATCH`: do NOT reboot. Flash `undo-NAME.zip` at once (it
+     accepts a half-written table) and STOP. The message also prints `dd` lines to restore by hand
+     from the recovery's `adb shell`.
+7. The recovery keeps using the OLD table until reboot. Do not mount, wipe, format or flash
+   anything else. The zip never formats anything. Use TWRP **Reboot > Bootloader** (or
+   `adb reboot bootloader`), then do section 10 exactly (getvar checks, then `fastboot erase
+   userdata` and `fastboot erase metadata`, then `fastboot reboot`). The zip printed the expected
+   `getvar` values; they equal `plan.txt`.
+
+To undo (put the original table back): boot the recovery, untick Data in **Mount**, flash
+`undo-NAME.zip` the same way (sideload from the PC). It refuses unless the disk holds the NEW
+table of this plan (or a half-written mix of the two); on the original table it prints
+`ALREADY APPLIED`. Then Reboot > Bootloader, `fastboot getvar partition-size:userdata` must be
+the ORIGINAL size, then `fastboot erase userdata`, `fastboot erase metadata`, `fastboot reboot`.
+The undo zip restores only the partition TABLE, not data: userdata must be erased again, the
+added partitions and their data are gone, and anything in super beyond its original size is lost
+(if a super image built for the bigger super was flashed, flash the stock super image too).
+The same STOP rules apply: if the undo zip refuses because the disk holds neither table, use
+section 11 or SP Flash Tool.
+
+Test-only: `MTKREP_TEST_ROOT=<dir>` makes the update-binary read `<dir>/dev/block`, `<dir>/sys`
+and `<dir>/proc/mounts` and accept an image file as the disk. It is for offline tests on a PC;
+never set it on a device.
+
 ## Rules (summary)
 
-- Never write anything to the device except through `write-gpt.sh` / `restore-gpt.sh` from a
-  verified plan. Never hand-edit `.bin` files.
+- Never write anything to the device except through `write-gpt.sh` / `restore-gpt.sh` or the
+  `apply-*.zip` / `undo-*.zip` from `mkzip`, all from a verified plan. Never hand-edit `.bin`
+  files or zips.
 - Never assume the sector size. Never skip the backup or its off-device copy.
 - Never touch partitions other than `super`, `userdata` and newly added ones.
 - Never erase anything in fastboot before `getvar` confirmed the new sizes.

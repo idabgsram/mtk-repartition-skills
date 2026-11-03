@@ -1,5 +1,12 @@
 # mtk-repartition-skills
 
+> [!WARNING]
+> **DWYOR — Do With Your Own Risk.** Repartitioning can wipe your data, soft-brick or hard-brick your device,
+> erase IMEI/calibration data or void your warranty. Everything here is provided "as is", without any warranty.
+> **You alone are responsible for any damage, data loss or other consequence of using this skill, its scripts or
+> its zips.** The repository owner and the skill's authors accept no liability whatsoever. Back up first, read every
+> step, and do not proceed if you do not understand it.
+
 An agent skill for safely editing the GPT partition table of MediaTek (MTK) Android phones and tablets
 (UFS or eMMC) from a rooted Android shell over adb. It is written step by step, with explicit checks and hard
 STOP conditions, so that even a small model can follow it without improvising.
@@ -80,7 +87,7 @@ or invoke `/mtk-repartition`.
 - Partitions such as `preloader`, `nvram`, `nvdata`, `protect1/2`, `md1img`, `seccfg`, `lk`, `boot` are never
   moved or resized; `nvram`/`nvdata`/`protect*` hold the IMEI and calibration data.
 - SP Flash Tool "Format All + Download" or "Firmware Upgrade" with the stock scatter file restores the stock layout.
-- Keep the GPT backups off the device. You use this at your own risk.
+- Keep the GPT backups off the device. DWYOR: you use this entirely at your own risk (see the warning at the top).
 
 ## Status
 

@@ -8,6 +8,11 @@ description: Safely edit the GPT partition table of a MediaTek (MTK) Android pho
 Every step is written out. Do them in order. Do not improvise, skip, or merge steps.
 **STOP** means: do not continue; tell the user exactly what failed and wait.
 
+**DWYOR (Do With Your Own Risk):** before step 1, tell the user plainly that repartitioning can wipe data,
+brick the device or destroy IMEI/calibration data; that everything is provided "as is" without warranty; and that
+the user alone bears all risk and responsibility, not the skill's authors or repository owner. Continue only after
+the user explicitly accepts this.
+
 The helper `gpt_tool.py` sits next to this file (use its absolute path, called `TOOL` below).
 It runs on the **PC** (Python 3, no extra packages). It works only on dump files and never
 writes to the device (the zips from `mkzip` write only when flashed in recovery, section 14).
